@@ -171,16 +171,16 @@ RISK_BANDS = {
 # Visual Theme Tokens (Clinical Intelligence - Clinical Light)
 # ---------------------------------------------------------------------------
 THEME = {
-    "app_bg": "#f8fafc",
+    "app_bg": "#f8faf9",
     "sidebar_bg": "#ffffff",
     "card_bg": "#ffffff",
-    "surface_elevated": "#f1f5f9",
-    "primary_teal": "#0284c7",  # Sky blue 600
-    "teal_hover": "#0369a1",  # Sky blue 700
-    "secondary_blue": "#0284c7",
+    "surface_elevated": "#f0fdf4",
+    "primary_teal": "#064e3b",  # Deep Forest Green (Helix theme)
+    "teal_hover": "#022c22",    # Hunter Green hover
+    "secondary_blue": "#059669", # Medical Emerald
     "text_main": "#0f172a",  # Slate 900
     "text_muted": "#64748b",  # Slate 500
-    "border": "#e2e8f0",  # Slate 200
+    "border": "#d1fae5",  # Soft Mint Border
     "success": "#10b981",  # Emerald 500
     "warning": "#f59e0b",  # Amber 500
     "error": "#ef4444",  # Red 500

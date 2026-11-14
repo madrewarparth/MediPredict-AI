@@ -12,8 +12,8 @@ from pathlib import Path
 
 
 st.set_page_config(
-    page_title="MediPredict AI - Dashboard Overview (Clinical Light)",
-    page_icon="🏥",
+    page_title="Helix MediPredict AI - Clinical Intelligence Portal",
+    page_icon="🌿",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -40,7 +40,7 @@ st.markdown(
         margin: 0 !important;
         padding: 0 !important;
         overflow: hidden !important;
-        background-color: #f8fafc !important;
+        background-color: #f8faf9 !important;
         height: 100vh !important;
         max-width: 100% !important;
         width: 100% !important;
@@ -50,7 +50,7 @@ st.markdown(
         height: 100vh !important;
         min-height: 100vh !important;
         border: none !important;
-        background-color: #f8fafc !important;
+        background-color: #f8faf9 !important;
         display: block !important;
     }
     </style>

@@ -191,8 +191,8 @@ def render_sidebar_header():
                         <div style="font-size: 0.72rem; color: {THEME['text_muted']}; font-weight: 500;">Hospital Clinical Intelligence</div>
                     </div>
                 </div>
-                <div style="margin-top: 0.6rem; display: inline-flex; align-items: center; gap: 0.35rem; background: #e0f2fe; color: #0369a1; padding: 0.2rem 0.6rem; border-radius: 6px; font-size: 0.75rem; font-weight: 600; border: 1px solid #bae6fd;">
-                    <span style="width: 6px; height: 6px; border-radius: 9999px; background: #0284c7;"></span>
+                <div style="margin-top: 0.6rem; display: inline-flex; align-items: center; gap: 0.35rem; background: #ecfdf5; color: #065f46; padding: 0.2rem 0.6rem; border-radius: 6px; font-size: 0.75rem; font-weight: 600; border: 1px solid #a7f3d0;">
+                    <span style="width: 6px; height: 6px; border-radius: 9999px; background: #059669;"></span>
                     <span>ML Decision Support</span>
                 </div>
             </div>
