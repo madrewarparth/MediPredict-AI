@@ -1,13 +1,21 @@
 [theme]
 base = "light"
-primaryColor = "#065f46"
-backgroundColor = "#f8fafc"
-secondaryBackgroundColor = "#ffffff"
-textColor = "#0f172a"
+primaryColor = "#0F766E"
+backgroundColor = "#F6F8F7"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#0F172A"
 font = "sans serif"
+borderColor = "#E2E8F0"
+showWidgetBorder = true
+baseRadius = "0.6rem"
 
 [server]
 headless = true
-enableCORS = false
 enableXsrfProtection = true
 maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"

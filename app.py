@@ -1,70 +1,45 @@
 """
-MediPredict AI - Executive Dashboard Portal (Clinical Light)
-Hospital Appointment No-Show Prediction & Appointment Operations Intelligence
-Organization: ALGIONS AI LABS PRIVATE LIMITED
+MediPredict AI - Streamlit entrypoint
+Hospital appointment no-show prediction & reminder-prioritisation decision support.
+
+Run:  streamlit run app.py
 """
 
 import streamlit as st
-import streamlit.components.v1 as components
-from pathlib import Path
 
-# Page configuration
-
+from src.ui_components import inject_custom_css, render_sidebar_header
 
 st.set_page_config(
-    page_title="Helix MediPredict AI - Clinical Intelligence Portal",
-    page_icon="🌿",
+    page_title="MediPredict AI",
+    page_icon=":material/health_and_safety:",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="auto",
 )
 
-# Seamless Full-Canvas CSS
-st.markdown(
-    """
-    <style>
-    /* Hide Streamlit default UI chrome to display exact Clinical Light design */
-    header[data-testid="stHeader"] {
-        display: none !important;
-    }
-    footer {
-        display: none !important;
-    }
-    [data-testid="stSidebar"] {
-        display: none !important;
-    }
-    #MainMenu {
-        visibility: hidden !important;
-    }
-    /* Responsive Full-Canvas Layout for all viewports (Mobile, Tablet, Desktop) */
-    html, body, [data-testid="stAppViewContainer"], .main, .main .block-container {
-        margin: 0 !important;
-        padding: 0 !important;
-        overflow: hidden !important;
-        background-color: #f8faf9 !important;
-        height: 100vh !important;
-        max-width: 100% !important;
-        width: 100% !important;
-    }
-    iframe {
-        width: 100% !important;
-        height: 100vh !important;
-        min-height: 100vh !important;
-        border: none !important;
-        background-color: #f8faf9 !important;
-        display: block !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+inject_custom_css()
+render_sidebar_header()
 
-# Load the exact HTML dashboard provided
-html_file = Path(__file__).resolve().parent / "assets" / "dashboard.html"
+pages = {
+    "": [
+        st.Page("app_pages/home.py", title="Home", icon=":material/home:", default=True),
+    ],
+    "Operations": [
+        st.Page("app_pages/single_prediction.py", title="Score an appointment", icon=":material/person_search:", url_path="score"),
+        st.Page("app_pages/bulk_prediction.py", title="Bulk review queue", icon=":material/upload_file:", url_path="bulk"),
+    ],
+    "Insights": [
+        st.Page("app_pages/overview.py", title="Overview", icon=":material/dashboard:", url_path="overview"),
+        st.Page("app_pages/analytics.py", title="Analytics", icon=":material/insights:", url_path="analytics"),
+    ],
+    "Model & governance": [
+        st.Page("app_pages/model_performance.py", title="Model performance", icon=":material/monitoring:", url_path="model"),
+        st.Page("app_pages/responsible_use.py", title="Data & responsible use", icon=":material/verified_user:", url_path="governance"),
+    ],
+}
 
-if html_file.exists():
-    with open(html_file, "r", encoding="utf-8") as f:
-        html_markup = f.read()
-    # Render full-featured dashboard with Tailwind, fonts, and client-side interactions
-    components.html(html_markup, height=2250, scrolling=True)
-else:
-    st.error("Dashboard template not found at assets/dashboard.html")
+nav = st.navigation(pages, position="sidebar", expanded=True)
+
+with st.sidebar:
+    st.caption("Human-in-the-loop decision support. Not a diagnostic or clinical triage system.")
+
+nav.run()

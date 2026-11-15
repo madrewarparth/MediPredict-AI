@@ -75,8 +75,9 @@ def derive_point_in_time_features(
         app_date = df_feat["AppointmentDay"].dt.floor("D")
         df_feat["waiting_days"] = (app_date - sched_date).dt.days
 
-    # Same-day booking indicator
+    # Same-day booking indicator and log-scaled lead time
     df_feat["is_same_day"] = (df_feat["waiting_days"] == 0).astype(int)
+    df_feat["log_waiting_days"] = np.log1p(df_feat["waiting_days"].clip(lower=0))
 
     # Booking moment temporal features
     df_feat["scheduled_hour"] = df_feat["ScheduledDay"].dt.hour
@@ -88,14 +89,16 @@ def derive_point_in_time_features(
     df_feat["gender"] = df_feat["Gender"].astype(str).str.upper()
     df_feat["scholarship"] = df_feat["Scholarship"].astype(int)
 
-    # Neighbourhood grouping (prevent high-cardinality overfitting)
+    # Neighbourhood grouping (prevent high-cardinality overfitting).
+    # Names are normalised to stripped upper-case so training and inference match.
+    df_feat["Neighbourhood"] = df_feat["Neighbourhood"].astype(str).str.strip().str.upper()
     if top_neighbourhoods is None:
         top_neighbourhoods = (
             df_feat["Neighbourhood"].value_counts().nlargest(TOP_NEIGHBOURHOODS_COUNT).index.tolist()
         )
 
-    df_feat["neighbourhood_grouped"] = df_feat["Neighbourhood"].apply(
-        lambda n: n if n in top_neighbourhoods else "Other"
+    df_feat["neighbourhood_grouped"] = df_feat["Neighbourhood"].where(
+        df_feat["Neighbourhood"].isin(top_neighbourhoods), "Other"
     )
 
     # Select only approved model features
@@ -149,6 +152,7 @@ def split_chronologically(
     # 2. Extract top neighbourhoods strictly from training partition
     top_neighbourhoods = (
         train_raw["Neighbourhood"]
+        .astype(str).str.strip().str.upper()
         .value_counts()
         .nlargest(TOP_NEIGHBOURHOODS_COUNT)
         .index.tolist()

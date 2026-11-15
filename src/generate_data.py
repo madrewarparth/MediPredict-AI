@@ -193,6 +193,22 @@ def generate_synthetic_appointments(
     return df
 
 
+def oracle_logit(waiting_days, age, scholarship) -> np.ndarray:
+    """
+    The noise-free part of the generator's ground-truth logit (see step 9 above).
+    Scoring appointments with it gives the best ROC-AUC any model can reach on
+    this synthetic data, because the remaining variation is pure random noise.
+    """
+    w = np.asarray(waiting_days, dtype=float)
+    return (
+        -1.45
+        + 0.040 * np.log1p(w) * 4.0
+        - 0.012 * (np.asarray(age, dtype=float) - 37)
+        + 0.35 * np.asarray(scholarship, dtype=float)
+        - 1.8 * (w == 0).astype(float)
+    )
+
+
 def ensure_dataset(force: bool = False):
     """Checks for existing dataset, or generates synthetic data if missing or forced."""
     DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)

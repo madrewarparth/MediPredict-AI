@@ -5,7 +5,6 @@ Tests for Inference Pipeline, Validation Guards, and Batch Integrity.
 from pathlib import Path
 import pytest
 import pandas as pd
-import numpy as np
 
 from src.predict import (
     InferenceEngine,
@@ -132,3 +131,37 @@ def test_missing_model_artifact_raises():
     with pytest.raises(ModelArtifactError):
         InferenceEngine(pipeline_path=Path("non_existent_model.joblib"))
 
+
+
+def test_missing_gender_is_rejected_not_fabricated(engine, valid_single_appointment):
+    rec = {k: v for k, v in valid_single_appointment.items() if k != "Gender"}
+    with pytest.raises(ValidationError, match="Gender"):
+        engine.predict_single(rec)
+
+
+def test_explanations_come_from_the_model(engine, valid_single_appointment):
+    long_wait = {**valid_single_appointment, "AppointmentDay": "2016-06-20T00:00:00Z"}
+    res = engine.predict_single(long_wait)
+    lead = [f for f in res["factors"] if f["feature"] == "waiting_days"]
+    assert lead and lead[0]["delta"] > 0, "A 50-day lead time should raise risk versus a typical booking"
+
+    same_day = {**valid_single_appointment, "AppointmentDay": "2016-05-01T00:00:00Z"}
+    res = engine.predict_single(same_day)
+    lead = [f for f in res["factors"] if f["feature"] == "waiting_days"]
+    assert lead and lead[0]["delta"] < 0, "Same-day booking should lower risk"
+
+
+def test_metadata_matches_feature_config(engine):
+    from src.config import ALL_MODEL_FEATURES
+
+    assert engine.metadata["features"]["all_model_features"] == ALL_MODEL_FEATURES
+    cut = engine.band_cutoffs
+    assert 0 < cut["moderate"] < cut["higher"] < 1
+
+
+def test_unseen_weekday_is_warned(engine, valid_single_appointment):
+    # 2016-05-15 is a Sunday; the training data has no Sunday appointments
+    res = engine.predict_single(valid_single_appointment)
+    assert any("Sunday" in w for w in res["warnings"])
+    weekday_rec = {**valid_single_appointment, "AppointmentDay": "2016-05-16T00:00:00Z"}
+    assert engine.predict_single(weekday_rec)["warnings"] == []

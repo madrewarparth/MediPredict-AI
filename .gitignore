@@ -12,6 +12,7 @@ ENV/
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 .pytest_cache/
+.ruff_cache/
 
 # Data and Models
 # models/*.pkl

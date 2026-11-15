@@ -125,7 +125,9 @@ FEATURE_POLICY = {
 }
 
 # Features passed to model matrix
-MODEL_NUMERIC_FEATURES = ["age", "waiting_days", "scheduled_hour"]
+# `log_waiting_days` is a monotone transform of lead time: attendance decays roughly
+# logarithmically with lead time, so this lets linear models capture the curve.
+MODEL_NUMERIC_FEATURES = ["age", "waiting_days", "log_waiting_days", "scheduled_hour"]
 MODEL_CATEGORICAL_FEATURES = [
     "gender",
     "neighbourhood_grouped",
@@ -138,53 +140,85 @@ ALL_MODEL_FEATURES = (
     MODEL_NUMERIC_FEATURES + MODEL_CATEGORICAL_FEATURES + MODEL_BINARY_FEATURES
 )
 
+# Human-readable names for the raw booking-time inputs (used in explanations)
+FEATURE_LABELS = {
+    "age": "Patient age",
+    "waiting_days": "Lead time (days)",
+    "log_waiting_days": "Lead time (log scale)",
+    "scheduled_hour": "Booking hour",
+    "gender": "Gender",
+    "neighbourhood_grouped": "Neighbourhood",
+    "scheduled_day_of_week": "Booking weekday",
+    "appointment_day_of_week": "Appointment weekday",
+    "scholarship": "Welfare enrolment",
+    "is_same_day": "Same-day booking",
+}
+
 TOP_NEIGHBOURHOODS_COUNT = 25
+
+# The bundled dataset in data/raw is produced by src/generate_data.py (synthetic,
+# Kaggle-schema). Set to False when you replace it with real hospital data.
+DATA_IS_SYNTHETIC = True
 
 # ---------------------------------------------------------------------------
 # Risk Band & Operational Thresholds
 # ---------------------------------------------------------------------------
+# Fallback only; the trained threshold lives in models/model_metadata.json.
 DEFAULT_CLASSIFICATION_THRESHOLD = 0.30
+
+# Band cut-offs are learned at training time and stored in metadata:
+#   Lower    : p <  operating threshold           (not flagged)
+#   Moderate : threshold <= p < higher cut-off    (flagged, routine review)
+#   Higher   : p >= higher cut-off                (flagged, priority call)
+# The higher cut-off is the validation-set quantile below, i.e. the top
+# (1 - quantile) share of appointments by estimated risk.
+HIGHER_BAND_QUANTILE = 0.85
+DEFAULT_BAND_CUTOFFS = {"moderate": 0.25, "higher": 0.40}
 
 RISK_BANDS = {
     "LOWER": {
         "name": "Lower estimated risk",
-        "color": "#22C55E",
-        "max_prob": 0.25,
-        "action": "Standard operational reminder protocol",
+        "short": "Lower",
+        "color": "#16A34A",
+        "priority": "Standard operations",
+        "action": "Standard automated reminder protocol.",
     },
     "MODERATE": {
         "name": "Moderate estimated risk",
-        "color": "#F59E0B",
-        "min_prob": 0.25,
-        "max_prob": 0.50,
-        "action": "Consider secondary reminder review if capacity permits",
+        "short": "Moderate",
+        "color": "#D97706",
+        "priority": "Routine review",
+        "action": "Flagged: add a secondary reminder if staff capacity allows.",
     },
     "HIGHER": {
         "name": "Higher estimated risk",
-        "color": "#F87171",
-        "min_prob": 0.50,
-        "action": "Priority candidate for staff outreach review (No auto-cancellation)",
+        "short": "Higher",
+        "color": "#DC2626",
+        "priority": "Priority review",
+        "action": "Flagged: priority candidate for a staff reminder call ~48h before. Never auto-cancel.",
     },
 }
 
 # ---------------------------------------------------------------------------
-# Visual Theme Tokens (Clinical Intelligence - Clinical Light)
+# Visual Theme Tokens (Clinical Light)
 # ---------------------------------------------------------------------------
 THEME = {
-    "app_bg": "#f8faf9",
-    "sidebar_bg": "#ffffff",
-    "card_bg": "#ffffff",
-    "surface_elevated": "#f0fdf4",
-    "primary_teal": "#064e3b",  # Deep Forest Green (Helix theme)
-    "teal_hover": "#022c22",    # Hunter Green hover
-    "secondary_blue": "#059669", # Medical Emerald
-    "text_main": "#0f172a",  # Slate 900
-    "text_muted": "#64748b",  # Slate 500
-    "border": "#d1fae5",  # Soft Mint Border
-    "success": "#10b981",  # Emerald 500
-    "warning": "#f59e0b",  # Amber 500
-    "error": "#ef4444",  # Red 500
-    "neutral": "#94a3b8",  # Slate 400
+    "app_bg": "#F6F8F7",
+    "sidebar_bg": "#FFFFFF",
+    "card_bg": "#FFFFFF",
+    "surface_elevated": "#EEF6F2",
+    "primary_teal": "#0F766E",
+    "teal_hover": "#115E59",
+    "secondary_blue": "#2563EB",
+    "text_main": "#0F172A",
+    "text_muted": "#5B6B7F",
+    "border": "#E2E8F0",
+    "success": "#16A34A",
+    "warning": "#D97706",
+    "error": "#DC2626",
+    "neutral": "#94A3B8",
+    "attended": "#0F766E",
+    "no_show": "#E11D48",
 }
 
 # ---------------------------------------------------------------------------

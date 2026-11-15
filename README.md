@@ -5,8 +5,29 @@
 > **Project Type:** AI/ML Internship Assessment Project  
 > **Organization:** ALGIONS AI LABS PRIVATE LIMITED  
 > **Primary Interface:** Streamlit (Multi-Page Web Dashboard)  
-> **Theme:** Clinical Intelligence — Dark Teal  
-> **Status:** Production-Ready & Fully Verified  
+> **Theme:** Clinical Light  
+
+![CI](https://github.com/madrewarparth/MediPredict-AI/actions/workflows/ci.yml/badge.svg)
+![Python](https://img.shields.io/badge/python-3.11-blue)
+![Tests](https://img.shields.io/badge/tests-25%20passed-success)
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://medipredict-ai.streamlit.app)
+
+> 🚀 **Live Demo:** Try the interactive application live on Streamlit Community Cloud: [medipredict-ai.streamlit.app](https://medipredict-ai.streamlit.app)
+
+![Score an appointment](docs/screenshots/score.png)
+
+### At a glance
+
+| | |
+| :--- | :--- |
+| **Problem** | Estimate, at booking time, how likely an appointment is to be missed, so staff call the right patients first |
+| **Data** | 110,524 bookings after cleaning (synthetic, Kaggle schema), 20.7% no-show rate |
+| **Validation** | Chronological 70 / 15 / 15 split by booking time; test split scored once |
+| **Model** | Calibrated logistic regression, picked over Random Forest and HistGradientBoosting on validation |
+| **Test result** | ROC-AUC **0.701** (data ceiling 0.701), recall **90%** at the review threshold, Brier **0.1505** |
+| **Trust** | Leakage audit, per-group calibration audit, model-based per-booking explanations |
+| **App** | 7-page Streamlit app (single + bulk scoring, analytics, threshold simulator), phone to desktop |
+| **Quality** | 25 tests, page smoke test, ruff lint, GitHub Actions CI, Docker |
 
 ---
 
@@ -46,200 +67,182 @@ Supervised Binary Classification:
 
 ---
 
+## 2a. Key Design Decisions
+
+| Decision | Why |
+| :--- | :--- |
+| Split by booking time, not at random | Random splits let the model see the future; a chronological split mirrors deployment. |
+| Exclude `SMS_received` | It is recorded after booking. In the data it *looks* predictive (17% vs 28.7% no-show) but within the same lead-time band the gap disappears (see `notebooks/01_eda.ipynb`). |
+| Calibrate, then tune the threshold | Staff read the number as a probability, so 30% must mean ~3 in 10. Calibration is checked on the untouched test split. |
+| Logistic regression over trees | Equal validation performance, faster, easier to explain, and reaches the data's ceiling once lead time is log-scaled. |
+| Bands learned from data | Lower = below the review threshold, Higher = top 15% of validation risk, so a band and the review flag never disagree. |
+| Explanations by re-scoring | Each input is replaced with a typical booking's value and the model re-scores, so explanations come from the model, not hand-written rules. |
+| Report the ceiling | On synthetic data we can compute the best achievable ROC-AUC; reporting it shows the model is not leaving signal on the table. |
+
+## 2b. Limitations & Next Steps
+
+- **Synthetic data.** Metrics describe the generator. Re-train on the real Kaggle file or hospital data before any use.
+- **Wide default net.** The F1-optimal threshold flags ~66% of bookings. A capacity-based threshold (e.g. "we can make 200 calls a day") is the natural next step; the simulator already shows the trade-off.
+- **Lower recall for patients 60+** (72% vs ~90% elsewhere) because their base rate is lower. A group-specific review threshold would close the gap without adding sensitive features.
+- **No patient history.** Prior no-shows are a strong real-world signal and are known at booking time; adding them (computed strictly before each booking) is the first feature to try on real data.
+- **Monitoring.** Track flag rate, calibration and per-group recall monthly, and re-train when they drift.
+
+---
+
+## Screens
+
+| Home | Bulk review queue |
+| :---: | :---: |
+| ![Home](docs/screenshots/home.png) | ![Bulk](docs/screenshots/bulk.png) |
+| **Model performance** | **Data & responsible use** |
+| ![Model](docs/screenshots/model.png) | ![Governance](docs/screenshots/governance_full.png) |
+| **Analytics** | **Mobile** |
+| ![Analytics](docs/screenshots/analytics.png) | <img src="docs/screenshots/mobile_score.png" width="260"> |
+
+---
+
 ## 3. Repository Architecture
 
 ```text
 MediPredict-AI/
-│
-├── app.py                          # Main portal and operational system overview
-├── requirements.txt                # Pinned production dependencies
-├── README.md                       # Comprehensive technical documentation
-├── .gitignore                      # Git exclusion rules
-│
-├── .streamlit/
-│   └── config.toml                 # Clinical Intelligence Dark Teal theme configuration
-│
-├── data/
-│   ├── raw/
-│   │   └── appointments.csv        # Raw dataset (110k records, Kaggle schema)
-│   └── processed/
-│       ├── appointments_clean.parquet  # High-efficiency processed dataset
-│       └── appointments_clean.csv      # Human-readable processed export
-│
-├── models/
-│   ├── appointment_pipeline.joblib # Production fitted preprocessing + calibrated ensemble
-│   └── model_metadata.json         # Comprehensive evaluation metrics, thresholds, and splits
-│
-├── notebooks/
-│   └── 01_eda.ipynb                # Exploratory analysis and point-in-time leakage audit
-│
+├── app.py                     # Streamlit entrypoint: st.navigation router + design system
+├── streamlit_app.py           # Streamlit Cloud default entrypoint (runs app.py)
+├── app_pages/
+│   ├── home.py                # What the tool does, live headline numbers, risk bands
+│   ├── single_prediction.py   # Score one booking, with model-based explanations
+│   ├── bulk_prediction.py     # Upload a CSV, ranked reminder queue, review ticks, export
+│   ├── overview.py            # Historical volume and attendance (filterable)
+│   ├── analytics.py           # No-show rate by lead time, timing, profile (with 95% CIs)
+│   ├── model_performance.py   # Test metrics, threshold simulator, ROC/PR, calibration
+│   └── responsible_use.py     # Data-quality audit, split, feature policy, rules of use
 ├── src/
-│   ├── __init__.py
-│   ├── config.py                   # Paths, feature dictionary, risk thresholds, theme tokens
-│   ├── generate_data.py            # High-fidelity synthetic benchmark dataset generator
-│   ├── data_preprocessing.py       # Schema validation, date parsing, anomaly filtering
-│   ├── feature_engineering.py      # Lead time derivation, OHE, chronological split
-│   ├── train_model.py              # Candidate training, threshold tuning, calibration, evaluation
-│   ├── predict.py                  # Production single & batch inference engine
-│   └── ui_components.py            # Dark teal CSS, metric cards, Plotly templates, badges
-│
-├── pages/
-│   ├── 1_Overview.py               # KPI summary, volume trends, attendance distributions
-│   ├── 2_Single_Prediction.py      # Interactive point-of-booking risk assessment form
-│   ├── 3_Bulk_Prediction.py        # Batch CSV upload, queue prioritization, CSV export
-│   ├── 4_Analytics.py              # Lead time decay curves, temporal patterns, demographics
-│   ├── 5_Model_Performance.py      # Candidate benchmark, threshold simulator, calibration curve
-│   └── 6_Data_Responsible_Use.py  # Governance policy, leakage audit, ethical boundaries
-│
-├── tests/
-│   ├── test_preprocessing.py       # 7 unit tests (schema, anomaly filters, leakage guards)
-│   └── test_inference.py           # 6 integration tests (single/batch inference, row order)
-│
-├── reports/
-│   └── model_evaluation.md         # Detailed technical evaluation audit report
-│
-└── assets/                         # Static visual assets
+│   ├── config.py              # Paths, feature policy, band rules, theme tokens
+│   ├── generate_data.py       # Synthetic Kaggle-schema generator (+ noise-free reference)
+│   ├── data_preprocessing.py  # Schema validation, date parsing, anomaly filtering
+│   ├── feature_engineering.py # Point-in-time features, chronological split
+│   ├── train_model.py         # Candidates, calibration, threshold, bands, metadata, report
+│   ├── predict.py             # Validated single + vectorised batch inference, explanations
+│   ├── batch_schema.py        # CSV column aliasing + sample template
+│   └── ui_components.py       # CSS, KPI grid, badges, callouts, Plotly style, cached loaders
+├── data/raw/appointments.csv  # 110,527 synthetic records (Kaggle schema)
+├── models/                    # appointment_pipeline.joblib + model_metadata.json
+├── reports/model_evaluation.md# Auto-generated evaluation report
+├── notebooks/01_eda.ipynb
+├── tests/                     # 25 unit/integration tests + smoke_app.py (renders every page)
+├── docs/screenshots/          # README / landing-page screenshots
+├── index.html                 # GitHub Pages landing page (reads models/model_metadata.json)
+└── .github/workflows/ci.yml   # lint + tests + page smoke test
 ```
+
+> [!NOTE]
+> The bundled dataset is **synthetic**, produced by `src/generate_data.py`. Its no-show label comes from a known formula
+> plus random noise, so every number below describes that generator, not a real hospital. To use real data, drop the
+> Kaggle *Medical Appointment No Shows* CSV (same schema) at `data/raw/appointments.csv`, set `DATA_IS_SYNTHETIC = False`
+> in `src/config.py`, and re-train.
 
 ---
 
 ## 4. Point-in-Time Feature Dictionary & Policy
 
-| Feature | Type | Status | Governance & Leakage Justification |
-| :--- | :--- | :--- | :--- |
-| `PatientId` | Integer | **EXCLUDED** | Direct patient identifier. Prone to memorization; zero generalization. |
-| `AppointmentID` | Integer | **EXCLUDED** | Internal primary key with no predictive validity. |
-| `Hipertension` | Binary | **EXCLUDED** | Clinical diagnosis. Excluded under strict non-clinical mandate. |
-| `Diabetes` | Binary | **EXCLUDED** | Clinical diagnosis. Excluded under strict non-clinical mandate. |
-| `Alcoholism` | Binary | **EXCLUDED** | Sensitive clinical indicator excluded by governance policy. |
-| `Handcap` | Integer | **EXCLUDED** | Disability indicator excluded to protect patient equity. |
-| `SMS_received` | Binary | **EXCLUDED** | Post-booking event. Occurs after scheduling; severe temporal leakage. |
-| `Age` | Numeric | **INCLUDED** | Patient age at booking (filtered to valid bounds 0-115). |
-| `Gender` | Categorical | **INCLUDED** | Administrative demographic recorded at booking. |
-| `Neighbourhood` | Categorical | **INCLUDED** | Clinic catchment area (top 25 retained, rest grouped to 'Other'). |
-| `Scholarship` | Binary | **INCLUDED** | Social welfare enrollment indicator (Bolsa Família). |
-| `waiting_days` | Numeric | **DERIVED** | Integer days between `ScheduledDay` and `AppointmentDay`. |
-| `is_same_day` | Binary | **DERIVED** | Indicator if appointment is booked for today (`waiting_days == 0`). |
-| `scheduled_hour`| Numeric | **DERIVED** | Hour of day booking occurred (0-23). |
-| `scheduled_day_of_week` | Categorical | **DERIVED** | Day name booking was initiated (Monday - Sunday). |
-| `appointment_day_of_week`| Categorical | **DERIVED** | Day name appointment is scheduled for. |
+| Feature | Status | Notes |
+| :--- | :--- | :--- |
+| `PatientId`, `AppointmentID` | **Excluded** | Identifiers |
+| `Hipertension`, `Diabetes`, `Alcoholism`, `Handcap` | **Excluded** | Clinical / disability data, out of scope |
+| `SMS_received` | **Excluded** | Happens after booking (leakage) |
+| `Age`, `Gender`, `Scholarship` | Included | Known at booking |
+| `Neighbourhood` | Included | Top 25 from the training split; the rest become `Other` |
+| `waiting_days`, `log_waiting_days`, `is_same_day` | Derived | Lead time from `ScheduledDay` → `AppointmentDay` |
+| `scheduled_hour`, `scheduled_day_of_week`, `appointment_day_of_week` | Derived | Booking and appointment timing |
 
 ---
 
 ## 5. Model Training & Evaluation Summary
 
-### Chronological Splits (Zero Future Leakage)
-- **Train Split (70%):** 77,366 samples (2016-04-10 to 2016-05-22)
-- **Validation Split (15%):** 16,578 samples (2016-05-22 to 2016-05-31) — Used for model selection & threshold tuning.
-- **Held-Out Test Split (15%):** 16,580 samples (2016-05-31 to 2016-06-09) — Evaluated strictly once.
+Chronological split by `ScheduledDay`: 70% train (77,366), 15% validation (16,578), 15% test (16,580).
 
-### Model Benchmark (Validation Partition)
-| Architecture | Val ROC-AUC | Val PR-AUC | Optimal Threshold | Val Precision | Val Recall | Val F1 Score |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Dummy (Baseline)** | 0.5000 | 0.2096 | 0.050 | 0.2096 | 1.0000 | 0.3465 |
-| **Logistic Regression** | 0.6955 | 0.3365 | 0.530 | 0.3012 | 0.7480 | 0.4296 |
-| **Random Forest** | 0.6948 | 0.3370 | 0.520 | 0.3021 | 0.7454 | 0.4298 |
-| **HistGradientBoosting (Calibrated)** | **0.6942** | **0.3387** | **0.170** | **0.2798** | **0.9096** | **0.4280** |
+### Candidates (validation split)
+| Model | ROC-AUC | PR-AUC | F1-optimal threshold | F1 |
+| :--- | :--- | :--- | :--- | :--- |
+| Dummy (prior) | 0.500 | 0.210 | – | 0.347 |
+| **Logistic Regression** | **0.696** | **0.338** | 0.51 | 0.430 |
+| Random Forest | 0.694 | 0.334 | 0.50 | 0.430 |
+| HistGradientBoosting | 0.694 | 0.339 | 0.45 | 0.428 |
 
-### Held-Out Test Evaluation (`HistGradientBoosting (Calibrated)`)
-- **Test ROC-AUC:** `0.6969`
-- **Test PR-AUC:** `0.3336`
-- **Test Recall (No-Show Capture Rate):** `90.31%` (3,104 of 3,437 true no-shows identified)
-- **Test Precision:** `28.28%`
-- **Test F1 Score:** `0.4307`
-- **Brier Score (Calibration Reliability):** `0.1509` (improved from uncalibrated 0.2236)
+The best (ROC-AUC + PR-AUC) candidate is then sigmoid-calibrated on validation (Brier 0.2245 → 0.1520), and the
+review threshold is re-tuned on the calibrated probabilities.
 
----
+### Held-out test split — `Logistic Regression (Calibrated)`, threshold 0.18
+| Metric | Value |
+| :--- | :--- |
+| ROC-AUC / PR-AUC | **0.701** / 0.337 |
+| Synthetic-data ceiling (noise-free generator formula) | 0.701 / 0.339 |
+| Recall | 90.0% (3,095 of 3,437 no-shows) |
+| Precision | 28.4% (base rate 20.7%) |
+| Share of bookings flagged | 65.6% |
+| Brier score | 0.1505 |
 
-## 6. Risk Bands & Operational Actions
-
-| Risk Band | Color | Threshold Range | Administrative Action |
-| :--- | :--- | :--- | :--- |
-| **Lower estimated risk** | `#22C55E` | `< 0.25` | Standard automated SMS reminder protocol. |
-| **Moderate estimated risk** | `#F59E0B` | `0.25 - 0.50` | Secondary reminder review if administrative capacity allows. |
-| **Higher estimated risk** | `#F87171` | `≥ 0.50` | Priority candidate for staff phone call review (48h prior). |
+The model reaches the ceiling on this data, so more complex models cannot raise accuracy here; the remaining
+error is the generator's random noise. The F1-optimal threshold casts a wide net (two-thirds of bookings), so teams
+with limited call capacity should start from the **Higher** band or raise the threshold in the simulator.
 
 ---
 
-## 7. Quickstart & Local Setup
+## 6. Risk Bands
 
-### 1. Prerequisites
-- Python 3.10+ (tested on Python 3.10.9)
-- Git
+Bands are learned at training time and stored in `models/model_metadata.json`, so they always agree with the review flag.
 
-### 2. Clone and Setup Environment
+| Band | Rule | Test bookings | Observed no-show rate | Suggested action |
+| :--- | :--- | :--- | :--- | :--- |
+| Lower | p < threshold (0.18) | 5,699 | 6.0% | Standard automated reminder |
+| Moderate | 0.18 ≤ p < 0.33 | 8,423 | 25.8% | Secondary reminder if capacity allows |
+| Higher | p ≥ 0.33 (top 15% of validation risk) | 2,458 | 37.4% | Priority staff call ~48h before. Never auto-cancel |
+
+---
+
+## 7. Quickstart
+
 ```bash
-git clone https://github.com/your-username/MediPredict-AI.git
+git clone https://github.com/madrewarparth/MediPredict-AI.git
 cd MediPredict-AI
-
-# Windows PowerShell:
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
-# Linux / macOS:
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 3. Install Dependencies
-```bash
+.venv\Scripts\activate          # Windows  (macOS/Linux: source .venv/bin/activate)
 pip install -r requirements.txt
+
+# optional: rebuild data/model (artifacts are committed)
+python -m src.generate_data     # only if data/raw/appointments.csv is missing
+python -m src.train_model       # ~1–2 min; writes models/ and reports/
+
+streamlit run app.py            # http://localhost:8501
 ```
 
-### 4. Run Dataset Preprocessing & Model Training
-```bash
-# If dataset is already in data/raw/appointments.csv, preprocess and train:
-python -m src.data_preprocessing
-python -m src.train_model
-```
+Docker: `docker build -t medipredict . && docker run -p 8501:8501 medipredict`
 
-### 5. Launch the Streamlit Application
-```bash
-streamlit run app.py
-```
-Open your browser to `http://localhost:8501`.
+### Bulk CSV format
+Required columns: `Age`, `Gender`, `ScheduledDay`, `AppointmentDay`. Optional: `Neighbourhood`, `Scholarship`,
+`AppointmentRef`. Common spellings (`appointment_date`, `sex`, `booking_date`, …) are recognised. Rows that fail
+validation are listed with a reason rather than silently dropped. A sample file is downloadable from the page.
 
 ---
 
-## 8. Verification & Testing
+## 8. Testing
 
-Run the full automated test suite (unit and integration tests):
 ```bash
-python -m pytest tests -v
+python -m pytest -q              # 25 passed
+python tests/smoke_app.py        # renders all 7 pages headlessly
+ruff check .                     # lint
 ```
-Output:
-```text
-tests/test_inference.py::test_inference_engine_initialization PASSED
-tests/test_inference.py::test_predict_single_returns_valid_probability PASSED
-tests/test_inference.py::test_predict_single_invalid_age_raises PASSED
-tests/test_inference.py::test_predict_single_negative_waiting_days_raises PASSED
-tests/test_inference.py::test_batch_prediction_row_count_and_order_preserved PASSED
-tests/test_inference.py::test_missing_model_artifact_raises PASSED
-tests/test_preprocessing.py::test_validate_raw_schema_missing_columns PASSED
-tests/test_preprocessing.py::test_clean_filters_invalid_age PASSED
-tests/test_preprocessing.py::test_clean_filters_negative_waiting_days PASSED
-tests/test_preprocessing.py::test_clean_target_encoding PASSED
-tests/test_preprocessing.py::test_feature_discipline_rejects_prohibited_columns PASSED
-tests/test_preprocessing.py::test_point_in_time_feature_matrix_columns PASSED
-tests/test_preprocessing.py::test_chronological_split_integrity PASSED
 
-============================= 13 passed in 5.67s ==============================
-```
+Covers schema validation, anomaly filters, leakage guards, chronological split, single/batch parity, row-order
+preservation, band/flag consistency, column aliasing (including the Neighbourhood regression), model-based
+explanations and unseen-weekday warnings.
 
 ---
 
-## 9. Visual Design System
+## 9. Design System
 
-The interface adheres to the **Clinical Intelligence — Dark Teal** theme tokens:
-- **App Background:** `#0B1220`
-- **Sidebar Background:** `#111C2E`
-- **Card Background:** `#162338`
-- **Primary Teal:** `#14B8A6`
-- **Teal Hover:** `#0D9488`
-- **Secondary Blue:** `#60A5FA`
-- **Main Text:** `#F8FAFC`
-- **Muted Text:** `#A7B4C8`
-- **Border:** `#2B3B52`
+Clinical Light: primary teal `#0F766E`, background `#F6F8F7`, text `#0F172A`, muted `#5B6B7F`, border `#E2E8F0`;
+risk colours Lower `#16A34A`, Moderate `#D97706`, Higher `#DC2626`. KPI cards use a CSS grid that drops to two
+columns on phones and one column under 380px.
 
 ---
 

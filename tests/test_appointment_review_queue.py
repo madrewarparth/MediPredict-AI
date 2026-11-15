@@ -1,77 +1,86 @@
 """
-Unit and Integration Tests for MediPredict AI Appointment Review Queue
-Validates strict schema adherence, non-fabrication of demographic attributes,
-dynamic probability ingestion, and risk band classification.
+Tests for bulk CSV schema handling and batch scoring of a review queue.
 """
 
-import io
-import importlib
 import pandas as pd
-import numpy as np
 import pytest
 
-# Load page module dynamically because filename begins with a number
-bulk_page = importlib.import_module("pages.3_Bulk_Prediction")
-normalize_dataframe_columns = bulk_page.normalize_dataframe_columns
+from src.batch_schema import (
+    missing_model_columns,
+    normalize_dataframe_columns,
+    sample_booking_template,
+)
+from src.config import RISK_BANDS
+from src.predict import get_inference_engine
 
 
-def test_appointment_review_queue_csv_schema():
-    """Verify that the approved 7-column review queue schema normalizes correctly."""
-    csv_data = """AppointmentRef,ScheduledSlot,LeadDays,ClinicSpecialty,NoShowProb,RiskBand,ActionStatus
-#APT-1001,Dec 18 2026 09:30 AM,7,ENT,0.240,Moderate estimated risk,Pending Review
-#APT-1002,Nov 23 2026 10:15 AM,14,ENT,0.385,Moderate estimated risk,Pending Review
-#APT-1003,Dec 12 2026 02:00 PM,28,Ophthalmology,0.682,Higher estimated risk,Pending Review
-#APT-1004,Dec 27 2026 11:30 AM,4,Orthopedics,0.125,Lower estimated risk,Pending Review
-#APT-1005,Jan 06 2027 08:45 AM,35,Orthopedics,0.748,Higher estimated risk,Pending Review
-#APT-1006,Dec 26 2026 03:15 PM,2,ENT,0.085,Lower estimated risk,Reviewed
-#APT-1007,Nov 27 2026 01:00 PM,19,Dermatology,0.510,Higher estimated risk,Pending Review
-"""
-    df = pd.read_csv(io.StringIO(csv_data))
-    norm_df = normalize_dataframe_columns(df)
-
-    # 1. No demographic attributes should be present
-    assert "Age" not in norm_df.columns
-    assert "Gender" not in norm_df.columns
-    assert "PatientName" not in norm_df.columns
-
-    # 2. Approved columns must be preserved
-    assert "AppointmentRef" in norm_df.columns
-    assert "ScheduledSlot" in norm_df.columns
-    assert "LeadDays" in norm_df.columns
-    assert "ClinicSpecialty" in norm_df.columns
-    assert "NoShowProb" in norm_df.columns
-    assert "RiskBand" in norm_df.columns
-    assert "ActionStatus" in norm_df.columns
-
-    # 3. Probabilities must be dynamic and distinct
-    probs = norm_df["NoShowProb"].tolist()
-    assert len(set(probs)) > 1, "Probabilities must be dynamic and not static demo values"
-    for p in probs:
-        assert 0.0 <= float(p) <= 1.0, f"Probability out of range: {p}"
-
-    # 4. References must match original exactly
-    refs = norm_df["AppointmentRef"].tolist()
-    assert refs[0] == "#APT-1001"
-    assert refs[1] == "#APT-1002"
-    assert refs[2] == "#APT-1003"
+@pytest.fixture
+def engine():
+    return get_inference_engine()
 
 
-def test_no_show_prob_percentage_strings():
-    """Verify handling of percentage strings in review queue CSV."""
-    csv_data = """AppointmentRef,ScheduledSlot,LeadDays,ClinicSpecialty,NoShowProb,RiskBand,ActionStatus
-#APT-2001,Dec 18 2026 09:30 AM,7,ENT,24.0%,Moderate estimated risk,Pending Review
-#APT-2002,Nov 23 2026 10:15 AM,14,Cardiology,68.2%,Higher estimated risk,Pending Review
-"""
-    df = pd.read_csv(io.StringIO(csv_data))
-    norm_df = normalize_dataframe_columns(df)
+def test_aliases_map_to_canonical_names():
+    df = pd.DataFrame(columns=["appointment_id", "patient_age", "Sex", "booking_date", "appointment_date",
+                               "Neighborhood", "welfare"])
+    out = normalize_dataframe_columns(df)
+    assert list(out.columns) == ["AppointmentRef", "Age", "Gender", "ScheduledDay", "AppointmentDay",
+                                 "Neighbourhood", "Scholarship"]
 
-    def parse_prob(val):
-        s = str(val).strip().replace("%", "")
-        f = float(s)
-        if f > 1.0 and f <= 100.0:
-            return f / 100.0
-        return f
 
-    probs = norm_df["NoShowProb"].apply(parse_prob).tolist()
-    assert abs(probs[0] - 0.24) < 1e-4
-    assert abs(probs[1] - 0.682) < 1e-4
+def test_neighbourhood_is_not_renamed_to_clinic_specialty():
+    """Regression: Neighbourhood used to be renamed away, so every row scored as 'Other'."""
+    out = normalize_dataframe_columns(pd.DataFrame(columns=["Neighbourhood", "Age"]))
+    assert "Neighbourhood" in out.columns
+    assert "ClinicSpecialty" not in out.columns
+
+
+def test_duplicate_aliases_do_not_overwrite():
+    out = normalize_dataframe_columns(pd.DataFrame(columns=["age", "patient_age"]))
+    assert list(out.columns).count("Age") == 1
+
+
+def test_missing_columns_reported():
+    df = normalize_dataframe_columns(pd.DataFrame(columns=["AppointmentRef", "NoShowProb", "LeadDays"]))
+    assert set(missing_model_columns(df)) == {"Age", "Gender", "ScheduledDay", "AppointmentDay"}
+
+
+def test_sample_template_scores_with_one_rejected_row(engine):
+    tmpl = normalize_dataframe_columns(sample_booking_template())
+    assert missing_model_columns(tmpl) == []
+    scored = engine.predict_batch(tmpl)
+    assert len(scored) == len(tmpl)
+    assert list(scored["AppointmentRef"]) == list(tmpl["AppointmentRef"])
+    bad = scored["estimated_no_show_prob"].isna()
+    assert bad.sum() == 1
+    assert "Temporal anomaly" in scored.loc[bad, "validation_error"].iloc[0]
+    assert scored.loc[~bad, "estimated_no_show_prob"].nunique() > 1
+
+
+def test_neighbourhood_value_reaches_model(engine):
+    base = {"Age": 30, "Gender": "F", "Scholarship": 0, "ScheduledDay": "2016-05-02T09:00:00Z",
+            "AppointmentDay": "2016-05-20T00:00:00Z"}
+    known = engine.top_neighbourhoods[0]
+    rec = engine.validate_record_dict({**base, "Neighbourhood": known.lower()})
+    assert engine.prepare_feature_row(rec)["neighbourhood_grouped"].iloc[0] == known
+
+
+def test_band_matches_review_flag(engine):
+    """Anything flagged must be Moderate or Higher; anything not flagged must be Lower."""
+    df = pd.DataFrame([
+        {"Age": a, "Gender": "F", "Scholarship": s, "Neighbourhood": "CENTRO",
+         "ScheduledDay": "2016-05-02T09:00:00Z", "AppointmentDay": app}
+        for a in (5, 25, 45, 80) for s in (0, 1)
+        for app in ("2016-05-02T00:00:00Z", "2016-05-10T00:00:00Z", "2016-06-20T00:00:00Z")
+    ])
+    for thr in (None, 0.10, 0.30, 0.60):
+        scored = engine.predict_batch(df, custom_threshold=thr)
+        flagged = scored["flagged_for_review"] == "Yes"
+        assert (scored.loc[~flagged, "risk_band"] == RISK_BANDS["LOWER"]["name"]).all()
+        assert (scored.loc[flagged, "risk_band"] != RISK_BANDS["LOWER"]["name"]).all()
+
+
+def test_batch_matches_single(engine):
+    tmpl = sample_booking_template().iloc[:6]
+    scored = engine.predict_batch(tmpl)
+    for rec, p in zip(tmpl.to_dict(orient="records"), scored["estimated_no_show_prob"], strict=True):
+        assert abs(engine.predict_single(rec)["estimated_probability"] - p) < 1e-4

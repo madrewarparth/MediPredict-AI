@@ -4,7 +4,6 @@ Tests for Data Preprocessing, Quality Checks, and Point-in-Time Feature Discipli
 
 import pytest
 import pandas as pd
-import numpy as np
 
 from src.data_preprocessing import (
     clean_appointment_data,

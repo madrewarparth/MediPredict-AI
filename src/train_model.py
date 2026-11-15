@@ -6,8 +6,9 @@ evaluates on held-out test data, and saves production pipeline artifact and meta
 """
 
 import json
-from datetime import datetime
-from typing import Dict, Any, List, Tuple
+import platform
+from datetime import datetime, timezone
+from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 import joblib
@@ -15,6 +16,13 @@ from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.inspection import permutation_importance
+import sklearn
+
+try:  # scikit-learn >= 1.6: cv="prefit" is deprecated/removed in favour of FrozenEstimator
+    from sklearn.frozen import FrozenEstimator
+except ImportError:  # pragma: no cover - older scikit-learn
+    FrozenEstimator = None
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import (
     roc_auc_score,
@@ -35,8 +43,11 @@ from src.config import (
     REPORTS_DIR,
     RANDOM_SEED,
     FEATURE_POLICY,
+    FEATURE_LABELS,
     RISK_BANDS,
     DEFAULT_CLASSIFICATION_THRESHOLD,
+    HIGHER_BAND_QUANTILE,
+    DATA_IS_SYNTHETIC,
 )
 from src.data_preprocessing import load_and_preprocess, save_processed_data
 from src.feature_engineering import (
@@ -50,7 +61,7 @@ from src.feature_engineering import (
 
 
 def sweep_thresholds(y_true: np.ndarray, y_probs: np.ndarray) -> Dict[str, Any]:
-    """Sweeps decision thresholds from 0.05 to 0.95 to find optimal F1 operating point."""
+    """Sweeps decision thresholds from 0.05 to 0.90 to find the F1-optimal operating point."""
     thresholds = np.linspace(0.05, 0.90, 86)
     best_f1 = -1.0
     best_thresh = DEFAULT_CLASSIFICATION_THRESHOLD
@@ -93,10 +104,11 @@ def evaluate_predictions(y_true: np.ndarray, y_probs: np.ndarray, threshold: flo
     rec = float(recall_score(y_true, y_pred, zero_division=0))
     f1 = float(f1_score(y_true, y_pred, zero_division=0))
 
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
 
     return {
         "threshold": round(float(threshold), 3),
+        "flagged_share": round(float(y_pred.mean()), 4),
         "roc_auc": round(roc_auc, 4),
         "pr_auc": round(pr_auc, 4),
         "brier_score": round(brier, 4),
@@ -110,6 +122,40 @@ def evaluate_predictions(y_true: np.ndarray, y_probs: np.ndarray, threshold: flo
             "tp": int(tp),
         },
     }
+
+
+def subgroup_audit(X: pd.DataFrame, y: np.ndarray, probs: np.ndarray, threshold: float) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Per-group metrics on the test split, so reviewers can see whether the model
+    flags, catches or mis-calibrates any group differently.
+    """
+    groups = {
+        "Gender": X["gender"].map({"F": "Female", "M": "Male"}).fillna(X["gender"]),
+        "Age group": pd.cut(X["age"], bins=[-1, 12, 24, 39, 59, 200],
+                            labels=["0-12", "13-24", "25-39", "40-59", "60+"]).astype(str),
+        "Welfare enrolment": X["scholarship"].map({0: "Not enrolled", 1: "Enrolled"}),
+    }
+    y = np.asarray(y)
+    flagged = probs >= threshold
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for gname, keys in groups.items():
+        rows = []
+        for key in sorted(pd.unique(keys)):
+            m = (keys == key).to_numpy()
+            pos = y[m] == 1
+            tp = int((flagged[m] & pos).sum())
+            rows.append({
+                "group": str(key),
+                "n": int(m.sum()),
+                "observed_rate": round(float(y[m].mean()), 4),
+                "mean_predicted": round(float(probs[m].mean()), 4),
+                "flag_rate": round(float(flagged[m].mean()), 4),
+                "recall": round(tp / int(pos.sum()), 4) if pos.any() else None,
+                "precision": round(tp / int(flagged[m].sum()), 4) if flagged[m].any() else None,
+                "roc_auc": round(float(roc_auc_score(y[m], probs[m])), 4) if 0 < y[m].mean() < 1 else None,
+            })
+        out[gname] = rows
+    return out
 
 
 def train_and_evaluate_all():
@@ -223,11 +269,14 @@ def train_and_evaluate_all():
 
     # Fit a calibrated classifier using sigmoid (Platt scaling) on the validation-compatible split
     try:
-        calibrated_pipeline = CalibratedClassifierCV(
-            estimator=best_pipeline,
-            method="sigmoid",
-            cv="prefit",
-        )
+        if FrozenEstimator is not None:
+            calibrated_pipeline = CalibratedClassifierCV(
+                estimator=FrozenEstimator(best_pipeline), method="sigmoid"
+            )
+        else:
+            calibrated_pipeline = CalibratedClassifierCV(
+                estimator=best_pipeline, method="sigmoid", cv="prefit"
+            )
         calibrated_pipeline.fit(X_val, y_val)
         cal_val_probs = calibrated_pipeline.predict_proba(X_val)[:, 1]
         brier_post = brier_score_loss(y_val, cal_val_probs)
@@ -253,18 +302,55 @@ def train_and_evaluate_all():
     val_metrics_final = evaluate_predictions(y_val.to_numpy(), eval_val_probs, threshold=best_threshold)
     print(f"      Calibrated optimal validation threshold: {best_threshold:.3f} (Val F1: {val_metrics_final['f1']:.4f}, Precision: {val_metrics_final['precision']:.4f}, Recall: {val_metrics_final['recall']:.4f})")
 
-    # Reliability curve data
-    prob_true, prob_pred = calibration_curve(y_val, eval_val_probs, n_bins=10)
-    calibration_data = {
-        "prob_true": [round(float(x), 4) for x in prob_true],
-        "prob_pred": [round(float(x), 4) for x in prob_pred],
-    }
+    # Risk band cut-offs, learned on validation so they stay consistent with the flag:
+    # everything below the operating threshold is "Lower" (not flagged), and the
+    # top (1 - HIGHER_BAND_QUANTILE) share of validation risk is "Higher".
+    higher_cut = float(np.quantile(eval_val_probs, HIGHER_BAND_QUANTILE))
+    higher_cut = max(higher_cut, best_threshold + 0.01)
+    band_cutoffs = {"moderate": round(float(best_threshold), 4), "higher": round(higher_cut, 4)}
+    print(f"      Risk band cut-offs: {band_cutoffs}")
 
     # 6. Held-Out Test Evaluation
     print(f"\n[6/7] Evaluating final model '{final_model_name}' on untouched held-out test split...")
     test_probs = final_pipeline.predict_proba(X_test)[:, 1]
     test_metrics = evaluate_predictions(y_test.to_numpy(), test_probs, threshold=best_threshold)
     test_metrics_default = evaluate_predictions(y_test.to_numpy(), test_probs, threshold=0.50)
+
+    # Reliability diagram on the untouched test split (the calibrator was fitted on
+    # validation, so a validation curve would be in-sample and look too good).
+    prob_true, prob_pred = calibration_curve(y_test, test_probs, n_bins=10, strategy="quantile")
+    calibration_data = {
+        "split": "test",
+        "strategy": "quantile",
+        "prob_true": [round(float(x), 4) for x in prob_true],
+        "prob_pred": [round(float(x), 4) for x in prob_pred],
+    }
+    y_test_np = y_test.to_numpy()
+    band_masks = {
+        "lower": test_probs < band_cutoffs["moderate"],
+        "moderate": (test_probs >= band_cutoffs["moderate"]) & (test_probs < band_cutoffs["higher"]),
+        "higher": test_probs >= band_cutoffs["higher"],
+    }
+    test_band_counts = {k: int(m.sum()) for k, m in band_masks.items()}
+    test_band_rates = {
+        k: (round(float(y_test_np[m].mean()), 4) if m.any() else None) for k, m in band_masks.items()
+    }
+
+    # Reference ceiling (synthetic data only): score test rows with the generator's
+    # noise-free logit. No model can beat this on average.
+    fairness = subgroup_audit(X_test, y_test.to_numpy(), test_probs, best_threshold)
+
+    reference_ceiling = None
+    if DATA_IS_SYNTHETIC:
+        from src.generate_data import oracle_logit
+
+        o = oracle_logit(X_test["waiting_days"], X_test["age"], X_test["scholarship"])
+        reference_ceiling = {
+            "roc_auc": round(float(roc_auc_score(y_test, o)), 4),
+            "pr_auc": round(float(average_precision_score(y_test, o)), 4),
+            "note": "Noise-free generator logit on the test split; the best achievable ranking on this synthetic data.",
+        }
+        print(f"      Synthetic-data ceiling: ROC-AUC {reference_ceiling['roc_auc']:.4f} | PR-AUC {reference_ceiling['pr_auc']:.4f}")
 
     print(f"      Held-out Test Performance (Threshold = {best_threshold}):")
     print(f"      -> ROC-AUC:   {test_metrics['roc_auc']:.4f}")
@@ -290,29 +376,42 @@ def train_and_evaluate_all():
         "recall": [round(float(x), 4) for x in rec_arr[::step_pr]],
     }
 
-    # Feature Importance / Coefficients extraction
+    # Global importance: permutation importance of each booking-time input on the
+    # validation split (model-agnostic, works through calibration and one-hot encoding).
+    print("      Computing permutation importance on validation split...")
     feature_importance_list = []
     try:
-        # Extract feature names from preprocessor
-        ohe_cols = (
-            best_pipeline.named_steps["preprocessor"]
-            .named_transformers_["cat"]
-            .get_feature_names_out(MODEL_CATEGORICAL_FEATURES)
-            .tolist()
+        perm = permutation_importance(
+            final_pipeline,
+            X_val,
+            y_val,
+            scoring="roc_auc",
+            n_repeats=5,
+            random_state=RANDOM_SEED,
+            n_jobs=1,
         )
-        all_trans_features = MODEL_NUMERIC_FEATURES + ohe_cols + MODEL_BINARY_FEATURES
-
-        raw_clf = best_pipeline.named_steps["classifier"]
-        if hasattr(raw_clf, "feature_importances_"):
-            importances = raw_clf.feature_importances_
-            for feat, imp in sorted(zip(all_trans_features, importances), key=lambda x: x[1], reverse=True)[:15]:
-                feature_importance_list.append({"feature": feat, "importance": round(float(imp), 4)})
-        elif hasattr(raw_clf, "coef_"):
-            coefs = raw_clf.coef_[0]
-            for feat, coef in sorted(zip(all_trans_features, coefs), key=lambda x: abs(x[1]), reverse=True)[:15]:
-                feature_importance_list.append({"feature": feat, "importance": round(float(abs(coef)), 4), "direction": "positive" if coef > 0 else "negative"})
+        for feat, mean, std in sorted(
+            zip(X_val.columns, perm.importances_mean, perm.importances_std, strict=True),
+            key=lambda x: x[1],
+            reverse=True,
+        ):
+            feature_importance_list.append({
+                "feature": feat,
+                "label": FEATURE_LABELS.get(feat, feat),
+                "importance": round(float(mean), 5),
+                "std": round(float(std), 5),
+            })
     except Exception as e:
-        print(f"      Notice: Feature importance extraction note: {e}")
+        print(f"      Notice: permutation importance failed: {e}")
+
+    # Reference profile used for per-appointment "what moved this estimate" explanations
+    reference_profile = {}
+    for col in X_train.columns:
+        if col in MODEL_NUMERIC_FEATURES:
+            reference_profile[col] = float(X_train[col].median())
+        else:
+            val = X_train[col].mode().iloc[0]
+            reference_profile[col] = int(val) if isinstance(val, (int, np.integer)) else str(val)
 
     # 7. Persistence
     print("\n[7/7] Persisting pipeline artifact and comprehensive audit metadata...")
@@ -327,10 +426,20 @@ def train_and_evaluate_all():
     metadata = {
         "model_name": final_model_name,
         "base_candidate": best_candidate_name,
-        "training_timestamp": datetime.utcnow().isoformat() + "Z",
+        "training_timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "selected_operating_threshold": best_threshold,
-        "threshold_selection_criterion": "Optimized on validation split F1 balance for appointment reminder review priority",
+        "threshold_selection_criterion": "F1-optimal threshold on the validation split (calibrated probabilities)",
         "risk_bands": RISK_BANDS,
+        "risk_band_cutoffs": band_cutoffs,
+        "test_band_counts": test_band_counts,
+        "test_band_observed_no_show_rate": test_band_rates,
+        "data_is_synthetic": DATA_IS_SYNTHETIC,
+        "reference_ceiling": reference_ceiling,
+        "reference_profile": reference_profile,
+        "subgroup_audit": fairness,
+        "known_categories": {
+            c: sorted(map(str, X_train[c].unique())) for c in MODEL_CATEGORICAL_FEATURES
+        },
         "features": {
             "all_model_features": ALL_MODEL_FEATURES,
             "numeric": MODEL_NUMERIC_FEATURES,
@@ -358,8 +467,10 @@ def train_and_evaluate_all():
         "pr_curve": pr_curve_data,
         "top_features": feature_importance_list,
         "system_info": {
-            "python_version": "3.10+",
-            "library": "scikit-learn",
+            "python_version": platform.python_version(),
+            "scikit_learn_version": sklearn.__version__,
+            "pandas_version": pd.__version__,
+            "numpy_version": np.__version__,
         },
     }
 
@@ -380,9 +491,46 @@ def generate_markdown_report(meta: Dict[str, Any]) -> None:
     test_def = meta["test_evaluation"]["at_default_threshold"]
     cm = test_opt["confusion_matrix"]
 
+    def _pct(v):
+        return "n/a" if v is None else f"{v * 100:.1f}%"
+
+    cut = meta["risk_band_cutoffs"]
+    counts = meta["test_band_counts"]
+    rates = meta["test_band_observed_no_show_rate"]
+    ceiling = meta.get("reference_ceiling")
+    ceiling_block = ""
+    subgroup_block = (
+        "\n## Subgroup Audit (test split)\n\n"
+        "Calibration is checked per group: mean predicted vs observed no-show rate should be close.\n"
+    )
+    for gname, rows in meta.get("subgroup_audit", {}).items():
+        subgroup_block += (
+            f"\n**{gname}**\n\n"
+            "| Group | n | Observed | Mean predicted | Flagged | Recall | Precision |\n"
+            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |\n"
+        )
+        for r in rows:
+            subgroup_block += (
+                f"| {r['group']} | {r['n']:,} | {_pct(r['observed_rate'])} | {_pct(r['mean_predicted'])} | "
+                f"{_pct(r['flag_rate'])} | {_pct(r['recall'])} | {_pct(r['precision'])} |\n"
+            )
+    subgroup_block += (
+        "\nFlag rates are expected to follow observed no-show rates. The check that matters is calibration "
+        "within each group (mean predicted close to observed), which means a given score carries the same "
+        "meaning for every group.\n\n---\n"
+    )
+    if ceiling:
+        ceiling_block = (
+            "\n### Synthetic-Data Ceiling\n\n"
+            "The bundled dataset is synthetic. Scoring the test split with the generator's own noise-free logit "
+            f"gives ROC-AUC **{ceiling['roc_auc']:.4f}** / PR-AUC **{ceiling['pr_auc']:.4f}**. "
+            f"The production model reaches **{test_opt['roc_auc']:.4f}** / **{test_opt['pr_auc']:.4f}**, so it recovers "
+            "almost all of the signal that exists; the rest is irreducible noise. Re-train on real data for real-world numbers.\n"
+        )
+
     report_content = f"""# MediPredict AI - Model Evaluation & Technical Audit Report
 
-**Document Status:** Complete & Verified  
+**Generated by:** `python -m src.train_model`  
 **Training Date:** {meta['training_timestamp']}  
 **Selected Model:** `{meta['model_name']}`  
 **Operating Decision Threshold:** `{meta['selected_operating_threshold']}`  
@@ -437,6 +585,15 @@ Evaluating `{meta['model_name']}` on the untouched test partition ({meta['splits
 | **Recall (Sensitivity)** | **{test_opt['recall']:.4f}** | {test_def['recall']:.4f} |
 | **F1 Score** | **{test_opt['f1']:.4f}** | {test_def['f1']:.4f} |
 | **Brier Score (Calibration)** | **{test_opt['brier_score']:.4f}** | {test_def['brier_score']:.4f} |
+| **Share of appointments flagged** | **{test_opt['flagged_share'] * 100:.1f}%** | {test_def['flagged_share'] * 100:.1f}% |
+{ceiling_block}
+### Risk Bands on the Test Split
+
+| Band | Probability range | Appointments | Observed no-show rate |
+| :--- | :--- | :--- | :--- |
+| Lower | < {cut['moderate']:.3f} | {counts['lower']:,} | {_pct(rates['lower'])} |
+| Moderate | {cut['moderate']:.3f} to {cut['higher']:.3f} | {counts['moderate']:,} | {_pct(rates['moderate'])} |
+| Higher | >= {cut['higher']:.3f} | {counts['higher']:,} | {_pct(rates['higher'])} |
 
 ### Test Confusion Matrix
 - **True Positives (Correctly prioritized no-shows):** {cm['tp']:,}
@@ -446,9 +603,10 @@ Evaluating `{meta['model_name']}` on the untouched test partition ({meta['splits
 
 ---
 
+{subgroup_block}
 ## 5. Threshold Selection Justification
 
-In appointment operations, a default threshold of `0.50` often misses a large proportion of actual no-shows due to class imbalance (~20% positive class rate). By tuning the decision threshold to `{meta['selected_operating_threshold']}` on the validation partition, the system achieves a balanced operational trade-off: capturing significant no-show volume (Recall: {test_opt['recall']*100:.1f}%) while maintaining actionable precision ({test_opt['precision']*100:.1f}%) for administrative staff without overwhelming staff capacity.
+In appointment operations, a default threshold of `0.50` often misses a large proportion of actual no-shows due to class imbalance (~20% positive class rate). The threshold `{meta['selected_operating_threshold']}` maximises F1 on the validation partition. On the test split it captures {test_opt['recall']*100:.1f}% of no-shows at {test_opt['precision']*100:.1f}% precision, but flags {test_opt['flagged_share']*100:.1f}% of all appointments. That is a broad net. Teams with limited call capacity should work the **Higher** band first, or raise the threshold with the simulator on the Model Performance page.
 
 ---
 

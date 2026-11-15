@@ -1,12 +1,13 @@
 """
 MediPredict AI - Production Inference Engine
-Handles single and batch inference, robust schema and range validation,
-point-in-time feature transformation, and risk band classification.
+Handles single and batch inference, schema and range validation,
+point-in-time feature transformation, risk banding and model-based explanations.
 """
 
 import json
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+
 import numpy as np
 import pandas as pd
 import joblib
@@ -15,19 +16,39 @@ from src.config import (
     MODEL_PIPELINE_FILE,
     MODEL_METADATA_FILE,
     DEFAULT_CLASSIFICATION_THRESHOLD,
+    DEFAULT_BAND_CUTOFFS,
     RISK_BANDS,
     ALL_MODEL_FEATURES,
+    FEATURE_LABELS,
 )
 
 
 class ModelArtifactError(FileNotFoundError):
     """Raised when model artifact or metadata is missing or corrupted."""
-    pass
 
 
 class ValidationError(ValueError):
     """Raised when inference input data is malformed or out of valid range."""
-    pass
+
+
+MIN_AGE, MAX_AGE = 0, 115
+# Raw booking columns the engine reads. Neighbourhood and Scholarship are optional.
+REQUIRED_INPUT_COLUMNS = ["Age", "Gender", "ScheduledDay", "AppointmentDay"]
+OPTIONAL_INPUT_COLUMNS = ["Neighbourhood", "Scholarship"]
+
+_GENDER_ALIASES = {"F": "F", "FEMALE": "F", "W": "F", "M": "M", "MALE": "M"}
+
+
+def _parse_timestamp(value: Any, field: str) -> pd.Timestamp:
+    if value is None or (isinstance(value, float) and np.isnan(value)) or str(value).strip() == "":
+        raise ValidationError(f"Field '{field}' is required.")
+    try:
+        ts = pd.to_datetime(value, utc=True)
+    except Exception as e:  # noqa: BLE001 - surface the parse problem to the user
+        raise ValidationError(f"Could not parse '{field}' timestamp: {value!r} ({e}).") from e
+    if pd.isna(ts):
+        raise ValidationError(f"Field '{field}' is required.")
+    return ts
 
 
 class InferenceEngine:
@@ -41,95 +62,93 @@ class InferenceEngine:
         self.pipeline_path = Path(pipeline_path)
         self.metadata_path = Path(metadata_path)
         self.pipeline = None
-        self.metadata = None
-        self.top_neighbourhoods = []
+        self.metadata: Dict[str, Any] = {}
+        self.top_neighbourhoods: List[str] = []
         self.threshold = DEFAULT_CLASSIFICATION_THRESHOLD
+        self.band_cutoffs = dict(DEFAULT_BAND_CUTOFFS)
+        self.reference_profile: Dict[str, Any] = {}
         self._load_artifacts()
 
+    # ------------------------------------------------------------------ loading
     def _load_artifacts(self) -> None:
-        """Loads fitted pipeline and companion metadata from disk."""
         if not self.pipeline_path.exists():
             raise ModelArtifactError(
                 f"Model pipeline artifact not found at: {self.pipeline_path}. "
-                "Ensure training workflow has been run."
+                "Run `python -m src.train_model` first."
             )
         if not self.metadata_path.exists():
-            raise ModelArtifactError(
-                f"Model metadata file not found at: {self.metadata_path}."
-            )
+            raise ModelArtifactError(f"Model metadata file not found at: {self.metadata_path}.")
 
         try:
             self.pipeline = joblib.load(self.pipeline_path)
         except Exception as e:
-            raise ModelArtifactError(f"Failed loading joblib pipeline: {e}")
+            raise ModelArtifactError(f"Failed loading joblib pipeline: {e}") from e
 
         try:
             with open(self.metadata_path, "r", encoding="utf-8") as f:
                 self.metadata = json.load(f)
-            self.top_neighbourhoods = self.metadata.get("features", {}).get(
-                "top_neighbourhoods", []
-            )
-            self.threshold = self.metadata.get(
-                "selected_operating_threshold", DEFAULT_CLASSIFICATION_THRESHOLD
-            )
         except Exception as e:
-            raise ModelArtifactError(f"Failed parsing metadata JSON: {e}")
+            raise ModelArtifactError(f"Failed parsing metadata JSON: {e}") from e
 
+        features = self.metadata.get("features", {})
+        self.top_neighbourhoods = [str(n).strip().upper() for n in features.get("top_neighbourhoods", [])]
+        self.threshold = float(self.metadata.get("selected_operating_threshold", DEFAULT_CLASSIFICATION_THRESHOLD))
+        self.band_cutoffs = {**DEFAULT_BAND_CUTOFFS, **self.metadata.get("risk_band_cutoffs", {})}
+        self.reference_profile = self.metadata.get("reference_profile", {})
+        self.known_categories = self.metadata.get("known_categories", {})
+
+        expected = features.get("all_model_features")
+        if expected and list(expected) != list(ALL_MODEL_FEATURES):
+            raise ModelArtifactError(
+                "Model artifact was trained with a different feature set than src/config.py. "
+                "Re-run `python -m src.train_model`."
+            )
+
+    # --------------------------------------------------------------- validation
     def validate_record_dict(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Validates and cleans a single input appointment dictionary."""
-        # Age validation
+        """Validates and normalises one raw booking record. Raises ValidationError."""
+        raw_age = record.get("Age")
         try:
-            age = int(record["Age"])
-        except (KeyError, ValueError, TypeError):
-            raise ValidationError("Field 'Age' is required and must be an integer.")
-        if age < 0 or age > 115:
-            raise ValidationError(
-                f"Invalid Age: {age}. Must be between 0 and 115 years."
-            )
-
-        # Gender validation
-        gender = str(record.get("Gender", "F")).strip().upper()
-        if gender not in ["F", "M"]:
-            raise ValidationError(f"Invalid Gender: '{gender}'. Must be 'F' or 'M'.")
-
-        # Scholarship
-        try:
-            scholarship = int(record.get("Scholarship", 0))
-            if scholarship not in [0, 1]:
-                scholarship = 1 if scholarship > 0 else 0
+            age_f = float(raw_age)
+            if np.isnan(age_f) or age_f != int(age_f):
+                raise ValueError
+            age = int(age_f)
         except (ValueError, TypeError):
+            raise ValidationError("Field 'Age' is required and must be a whole number.") from None
+        if age < MIN_AGE or age > MAX_AGE:
+            raise ValidationError(f"Invalid Age: {age}. Must be between {MIN_AGE} and {MAX_AGE} years.")
+
+        raw_gender = record.get("Gender")
+        if raw_gender is None or (isinstance(raw_gender, float) and np.isnan(raw_gender)):
+            raise ValidationError("Field 'Gender' is required ('F' or 'M').")
+        gender = _GENDER_ALIASES.get(str(raw_gender).strip().upper())
+        if gender is None:
+            raise ValidationError(f"Invalid Gender: '{raw_gender}'. Must be 'F' or 'M'.")
+
+        raw_schol = record.get("Scholarship", 0)
+        if raw_schol is None or (isinstance(raw_schol, float) and np.isnan(raw_schol)):
+            raw_schol = 0
+        schol_str = str(raw_schol).strip().lower()
+        if schol_str in {"1", "1.0", "yes", "y", "true", "enrolled"}:
+            scholarship = 1
+        elif schol_str in {"0", "0.0", "no", "n", "false", "", "not enrolled"}:
             scholarship = 0
+        else:
+            raise ValidationError(f"Invalid Scholarship value: '{raw_schol}'. Use 0/1 or Yes/No.")
 
-        # Neighbourhood
-        neighbourhood = str(record.get("Neighbourhood", "Other")).strip().upper()
+        raw_n = record.get("Neighbourhood")
+        if raw_n is None or (isinstance(raw_n, float) and np.isnan(raw_n)) or str(raw_n).strip() == "":
+            neighbourhood = "OTHER"
+        else:
+            neighbourhood = str(raw_n).strip().upper()
 
-        # Date validations
-        sched_val = record.get("ScheduledDay")
-        app_val = record.get("AppointmentDay")
-        if not sched_val or not app_val:
-            raise ValidationError(
-                "Both 'ScheduledDay' and 'AppointmentDay' timestamps are required."
-            )
-
-        try:
-            sched_dt = pd.to_datetime(sched_val, utc=True)
-        except Exception as e:
-            raise ValidationError(f"Could not parse 'ScheduledDay' timestamp: {sched_val}. Error: {e}")
-
-        try:
-            app_dt = pd.to_datetime(app_val, utc=True)
-        except Exception as e:
-            raise ValidationError(f"Could not parse 'AppointmentDay' timestamp: {app_val}. Error: {e}")
-
-        sched_date = sched_dt.floor("D")
-        app_date = app_dt.floor("D")
-        waiting_days = (app_date - sched_date).days
-
+        sched_dt = _parse_timestamp(record.get("ScheduledDay"), "ScheduledDay")
+        app_dt = _parse_timestamp(record.get("AppointmentDay"), "AppointmentDay")
+        waiting_days = int((app_dt.floor("D") - sched_dt.floor("D")).days)
         if waiting_days < 0:
             raise ValidationError(
-                f"Temporal anomaly: AppointmentDay ({app_date.strftime('%Y-%m-%d')}) "
-                f"cannot occur before ScheduledDay ({sched_date.strftime('%Y-%m-%d')}). "
-                f"Waiting days cannot be negative ({waiting_days})."
+                f"Temporal anomaly: AppointmentDay ({app_dt:%Y-%m-%d}) cannot occur before "
+                f"ScheduledDay ({sched_dt:%Y-%m-%d}). Waiting days cannot be negative ({waiting_days})."
             )
 
         return {
@@ -140,172 +159,199 @@ class InferenceEngine:
             "ScheduledDay": sched_dt,
             "AppointmentDay": app_dt,
             "waiting_days": waiting_days,
-            "is_same_day": 1 if waiting_days == 0 else 0,
+            "is_same_day": int(waiting_days == 0),
             "scheduled_hour": int(sched_dt.hour),
             "scheduled_day_of_week": sched_dt.day_name(),
             "appointment_day_of_week": app_dt.day_name(),
         }
 
-    def prepare_feature_row(self, clean_rec: Dict[str, Any]) -> pd.DataFrame:
-        """Prepares a single-row DataFrame formatted with exact model features."""
-        neighbourhood = clean_rec["Neighbourhood"]
-        neighbourhood_grouped = (
-            neighbourhood if neighbourhood in self.top_neighbourhoods else "Other"
-        )
-
-        row_dict = {
+    def _feature_dict(self, clean_rec: Dict[str, Any]) -> Dict[str, Any]:
+        n = clean_rec["Neighbourhood"]
+        return {
             "age": clean_rec["Age"],
             "waiting_days": clean_rec["waiting_days"],
+            "log_waiting_days": float(np.log1p(clean_rec["waiting_days"])),
             "scheduled_hour": clean_rec["scheduled_hour"],
             "gender": clean_rec["Gender"],
-            "neighbourhood_grouped": neighbourhood_grouped,
+            "neighbourhood_grouped": n if n in self.top_neighbourhoods else "Other",
             "scheduled_day_of_week": clean_rec["scheduled_day_of_week"],
             "appointment_day_of_week": clean_rec["appointment_day_of_week"],
             "scholarship": clean_rec["Scholarship"],
             "is_same_day": clean_rec["is_same_day"],
         }
-        return pd.DataFrame([row_dict])[ALL_MODEL_FEATURES]
 
-    def _determine_risk_band(self, prob: float) -> Dict[str, Any]:
-        """Categorizes predicted probability into human-interpretable operational risk bands."""
-        if prob < RISK_BANDS["LOWER"]["max_prob"]:
-            band_info = RISK_BANDS["LOWER"]
-            priority = "Standard Operations"
-        elif prob < RISK_BANDS["MODERATE"]["max_prob"]:
-            band_info = RISK_BANDS["MODERATE"]
-            priority = "Medium Priority Review"
-        else:
-            band_info = RISK_BANDS["HIGHER"]
-            priority = "High Priority Review"
+    def prepare_feature_row(self, clean_rec: Dict[str, Any]) -> pd.DataFrame:
+        """Single-row DataFrame with exactly the model's feature columns."""
+        return pd.DataFrame([self._feature_dict(clean_rec)])[ALL_MODEL_FEATURES]
 
-        return {
-            "band_name": band_info["name"],
-            "color": band_info["color"],
-            "priority": priority,
-            "action": band_info["action"],
+    # ------------------------------------------------------------------ banding
+    def _clip_threshold(self, custom_threshold: Optional[float]) -> float:
+        t = self.threshold if custom_threshold is None else float(custom_threshold)
+        return max(0.01, min(0.99, t))
+
+    def band_key(self, prob: float, threshold: Optional[float] = None) -> str:
+        """LOWER below the review threshold, HIGHER at/above the priority cut-off, else MODERATE."""
+        t = self._clip_threshold(threshold)
+        higher = max(self.band_cutoffs["higher"], t)
+        if prob >= higher:
+            return "HIGHER"
+        if prob >= t:
+            return "MODERATE"
+        return "LOWER"
+
+    def _determine_risk_band(self, prob: float, threshold: Optional[float] = None) -> Dict[str, Any]:
+        key = self.band_key(prob, threshold)
+        b = RISK_BANDS[key]
+        return {"key": key, "band_name": b["name"], "color": b["color"], "priority": b["priority"], "action": b["action"]}
+
+    # -------------------------------------------------------------- explanation
+    def explain(self, feature_df: pd.DataFrame, base_prob: float, top_k: int = 5) -> List[Dict[str, Any]]:
+        """
+        Model-based, per-appointment explanation. For each input we swap in the value a
+        typical training appointment has (median / most common) and re-score; the change
+        in probability is how much that input moved this estimate. Associations, not causes.
+        """
+        if not self.reference_profile:
+            return []
+        groups = {
+            "waiting_days": ["waiting_days", "log_waiting_days", "is_same_day"],
+            "age": ["age"],
+            "scholarship": ["scholarship"],
+            "gender": ["gender"],
+            "neighbourhood_grouped": ["neighbourhood_grouped"],
+            "scheduled_hour": ["scheduled_hour"],
+            "scheduled_day_of_week": ["scheduled_day_of_week"],
+            "appointment_day_of_week": ["appointment_day_of_week"],
         }
+        variants, names = [], []
+        row = feature_df.iloc[0].to_dict()
+        for name, cols in groups.items():
+            ref = dict(row)
+            if name == "waiting_days":
+                w = float(self.reference_profile.get("waiting_days", row["waiting_days"]))
+                ref["waiting_days"] = w
+                ref["log_waiting_days"] = float(np.log1p(w))
+                ref["is_same_day"] = int(w == 0)
+            else:
+                for c in cols:
+                    if c in self.reference_profile:
+                        ref[c] = self.reference_profile[c]
+            if all(ref[c] == row[c] for c in cols):
+                continue
+            variants.append(ref)
+            names.append(name)
+        if not variants:
+            return []
+        probs = self.pipeline.predict_proba(pd.DataFrame(variants)[ALL_MODEL_FEATURES])[:, 1]
 
-    def predict_single(
-        self, record: Dict[str, Any], custom_threshold: Optional[float] = None
-    ) -> Dict[str, Any]:
-        """
-        Generates probability estimate, operational risk band, and feature
-        breakdown for a single appointment booking record.
-        """
+        def _fmt(name: str, value: Any) -> str:
+            if name == "waiting_days":
+                return "same day" if int(value) == 0 else f"{int(value)} days"
+            if name == "scholarship":
+                return "enrolled" if int(value) == 1 else "not enrolled"
+            if name == "gender":
+                return {"F": "female", "M": "male"}.get(str(value), str(value))
+            if name == "scheduled_hour":
+                return f"{int(value):02d}:00"
+            if name == "neighbourhood_grouped":
+                return str(value).title()
+            return str(int(value)) if isinstance(value, (int, float, np.integer, np.floating)) else str(value)
+
+        out = []
+        for name, p_ref in zip(names, probs, strict=True):
+            delta = float(base_prob - p_ref)
+            out.append({
+                "feature": name,
+                "label": FEATURE_LABELS.get(name, name),
+                "value": _fmt(name, row[name]),
+                "reference": _fmt(name, self.reference_profile.get(name, row[name])),
+                "delta": round(delta, 4),
+                "direction": "raises" if delta > 0 else "lowers",
+            })
+        out.sort(key=lambda d: abs(d["delta"]), reverse=True)
+        return [d for d in out if abs(d["delta"]) >= 0.005][:top_k]
+
+    # ----------------------------------------------------------------- predict
+    def predict_single(self, record: Dict[str, Any], custom_threshold: Optional[float] = None) -> Dict[str, Any]:
+        """Probability, risk band, review flag and explanation for one booking record."""
         clean_rec = self.validate_record_dict(record)
         feature_df = self.prepare_feature_row(clean_rec)
+        threshold = self._clip_threshold(custom_threshold)
 
-        threshold = custom_threshold if custom_threshold is not None else self.threshold
-        threshold = max(0.01, min(0.99, float(threshold)))
-
-        # Pipeline returns probabilities
-        prob_arr = self.pipeline.predict_proba(feature_df)
-        prob = float(prob_arr[0, 1])
-
-        # Flagged if prob >= operating threshold
+        prob = float(self.pipeline.predict_proba(feature_df)[0, 1])
         is_flagged = bool(prob >= threshold)
-        risk = self._determine_risk_band(prob)
+        risk = self._determine_risk_band(prob, threshold)
+        factors = self.explain(feature_df, prob)
 
-        # Transparent feature contribution explanation (heuristic comparison to baseline averages)
-        factors = []
-        if clean_rec["is_same_day"] == 1:
-            factors.append({
-                "factor": "Same-Day Booking",
-                "influence": "Substantially Decreases Risk",
-                "detail": "Appointment booked for the same calendar date. Historical same-day no-show rate is under 5%.",
-            })
-        elif clean_rec["waiting_days"] > 14:
-            factors.append({
-                "factor": "Extended Waiting Time (Lead Time)",
-                "influence": "Increases Risk",
-                "detail": f"{clean_rec['waiting_days']} days between booking and appointment. Longer lead times correlate with higher missed rates.",
-            })
-        elif clean_rec["waiting_days"] <= 3:
-            factors.append({
-                "factor": "Short Waiting Time",
-                "influence": "Decreases Risk",
-                "detail": f"Only {clean_rec['waiting_days']} day(s) lead time.",
-            })
-
-        if clean_rec["Age"] < 25:
-            factors.append({
-                "factor": "Younger Age Demographic",
-                "influence": "Slightly Increases Risk",
-                "detail": f"Age {clean_rec['Age']}. Younger adult cohorts historically show slightly elevated missed appointment frequencies.",
-            })
-        elif clean_rec["Age"] >= 60:
-            factors.append({
-                "factor": "Senior Age Demographic",
-                "influence": "Decreases Risk",
-                "detail": f"Age {clean_rec['Age']}. Older demographic cohorts show high consistency in clinic attendance.",
-            })
-
-        if clean_rec["Scholarship"] == 1:
-            factors.append({
-                "factor": "Social Welfare Enrollment (Bolsa Família)",
-                "influence": "Moderate Risk Association",
-                "detail": "Enrolled in social welfare assistance program.",
-            })
+        warnings = []
+        unseen_day = feature_df["appointment_day_of_week"].iloc[0]
+        if self.known_categories and unseen_day not in self.known_categories.get("appointment_day_of_week", [unseen_day]):
+            warnings.append(
+                f"No {unseen_day} appointments exist in the training data, so the model cannot judge that weekday. "
+                "Treat this estimate with extra caution."
+            )
+            factors = [f for f in factors if f["feature"] != "appointment_day_of_week"]
 
         return {
             "estimated_probability": round(prob, 4),
             "probability_percent": round(prob * 100, 2),
             "threshold_used": round(threshold, 3),
             "review_flag": is_flagged,
-            "status_label": "Review Candidate (Elevated Miss Probability)" if is_flagged else "Standard Protocol",
+            "status_label": "Flagged for reminder review" if is_flagged else "Standard protocol",
+            "risk_key": risk["key"],
             "risk_band": risk["band_name"],
             "risk_color": risk["color"],
             "review_priority": risk["priority"],
             "operational_action": risk["action"],
             "waiting_days": clean_rec["waiting_days"],
             "is_same_day": bool(clean_rec["is_same_day"]),
+            "neighbourhood_in_model": clean_rec["Neighbourhood"] in self.top_neighbourhoods,
             "factors": factors,
+            "warnings": warnings,
             "governance_notice": (
-                "MediPredict AI provides statistical risk estimates to aid staff prioritization. "
+                "MediPredict AI provides statistical risk estimates to aid staff prioritisation. "
                 "This is not a certainty and must not be used to cancel appointments or deny care."
             ),
         }
 
-    def predict_batch(
-        self, df: pd.DataFrame, custom_threshold: Optional[float] = None
-    ) -> pd.DataFrame:
+    def predict_batch(self, df: pd.DataFrame, custom_threshold: Optional[float] = None) -> pd.DataFrame:
         """
-        Scores a batch of appointments.
-        Guarantees preserving original row count, row order, and original columns,
-        augmenting with model predictions and risk bands.
+        Scores a batch of raw booking records in one model call.
+        Preserves row count, order and original columns; invalid rows get NaN plus a reason.
         """
-        threshold = custom_threshold if custom_threshold is not None else self.threshold
-        threshold = max(0.01, min(0.99, float(threshold)))
-
+        threshold = self._clip_threshold(custom_threshold)
         res_df = df.copy()
         n_rows = len(res_df)
 
-        probs = []
-        bands = []
-        priorities = []
-        flags = []
-        colors = []
-        errors = []
-
-        for idx, row in res_df.iterrows():
-            rec_dict = row.to_dict()
+        feats, ok_idx, errors = [], [], [None] * n_rows
+        for i, rec in enumerate(res_df.to_dict(orient="records")):
             try:
-                pred = self.predict_single(rec_dict, custom_threshold=threshold)
-                probs.append(pred["estimated_probability"])
-                bands.append(pred["risk_band"])
-                priorities.append(pred["review_priority"])
-                flags.append("Yes" if pred["review_flag"] else "No")
-                colors.append(pred["risk_color"])
-                errors.append(None)
-            except Exception as e:
-                probs.append(np.nan)
-                bands.append("Not Scored")
-                priorities.append("Validation Error")
-                flags.append("N/A")
-                colors.append(RISK_BANDS["LOWER"]["color"])
-                errors.append(str(e))
+                feats.append(self._feature_dict(self.validate_record_dict(rec)))
+                ok_idx.append(i)
+            except ValidationError as e:
+                errors[i] = str(e)
 
-        res_df["estimated_no_show_prob"] = probs
+        probs = np.full(n_rows, np.nan)
+        waits = np.full(n_rows, np.nan)
+        if feats:
+            X = pd.DataFrame(feats)[ALL_MODEL_FEATURES]
+            probs[ok_idx] = self.pipeline.predict_proba(X)[:, 1]
+            waits[ok_idx] = X["waiting_days"].to_numpy()
+
+        bands, priorities, flags = [], [], []
+        for p in probs:
+            if np.isnan(p):
+                bands.append("Not scored")
+                priorities.append("Validation error")
+                flags.append("N/A")
+            else:
+                b = RISK_BANDS[self.band_key(float(p), threshold)]
+                bands.append(b["name"])
+                priorities.append(b["priority"])
+                flags.append("Yes" if p >= threshold else "No")
+
+        res_df["waiting_days"] = waits
+        res_df["estimated_no_show_prob"] = np.round(probs, 4)
         res_df["risk_band"] = bands
         res_df["review_priority"] = priorities
         res_df["flagged_for_review"] = flags
@@ -315,8 +361,7 @@ class InferenceEngine:
         return res_df
 
 
-# Module-level singleton
-_inference_engine_instance = None
+_inference_engine_instance: Optional[InferenceEngine] = None
 
 
 def get_inference_engine() -> InferenceEngine:
@@ -338,6 +383,6 @@ if __name__ == "__main__":
         "AppointmentDay": "2016-05-25T00:00:00Z",
     }
     result = engine.predict_single(sample)
-    print("Single prediction test result:")
-    print(f"Prob: {result['estimated_probability']} | Risk Band: {result['risk_band']} | Flagged: {result['review_flag']}")
-
+    print(f"Prob: {result['estimated_probability']} | Band: {result['risk_band']} | Flagged: {result['review_flag']}")
+    for f in result["factors"]:
+        print(f"  {f['label']}: {f['value']} {f['direction']} risk by {abs(f['delta']) * 100:.1f} pts")
